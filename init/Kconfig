@@ -198,7 +198,6 @@ config LOCALVERSION_AUTO
 
 	  which is done within the script "scripts/setlocalversion".)
 
-
 config BUILD_SALT
 	string "Build ID Salt"
 	default ""
@@ -208,14 +207,13 @@ config BUILD_SALT
 	  This is mostly useful for distributions which want to ensure the
 	  build is unique between builds. It's safe to leave the default.
 
-config LOCALVERSION_BRANCH_SHA
-	bool "Leave only branch name and current tree"
+config LOCALVERSION_SHA
+	bool "Leave only current tree"
 	default y
 	depends on LOCALVERSION_AUTO
 	depends on !COMPILE_TEST
 	help
-	  A cleaner version of LOCALVERSION_AUTO, contains branch name
-	  and current tree.
+	  A cleaner version of LOCALVERSION_AUTO, contains current tree.
 
 config HAVE_KERNEL_GZIP
 	bool
