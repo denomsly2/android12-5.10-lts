@@ -44,6 +44,12 @@ ifeq ($(CONFIG_BROKEN_GAS_INST),y)
 $(warning Detected assembler with broken .inst; disassembly will be unreliable)
 endif
 
+# Optimize for MediaTek Helio G99 (MT6789)
+# CPU: 2x Cortex-A76 + 6x Cortex-A55
+KBUILD_CFLAGS += \
+	-march=armv8.2-a+crypto \
+	-mtune=cortex-a76
+	
 KBUILD_CFLAGS	+= -mgeneral-regs-only	\
 		   $(compat_vdso) $(cc_has_k_constraint)
 KBUILD_CFLAGS	+= $(call cc-disable-warning, psabi)
