@@ -31,7 +31,7 @@ echo "Clang version  : $("$CLANG_PATH/bin/clang" --version | head -n1)"
 # ── Polly availability check ─────────────────────────────────────────────────
 POLLY_FLAGS=""
 
-if "$CLANG_PATH/bin/clang" -mllvm -polly -x c /dev/null -o /dev/null 2>/dev/null; then
+if "$CLANG_PATH/bin/clang" -mllvm --help-hidden 2>/dev/null | grep -q "\-polly"; then
     echo "Polly: available"
 
     POLLY_FLAGS="
@@ -44,7 +44,7 @@ if "$CLANG_PATH/bin/clang" -mllvm -polly -x c /dev/null -o /dev/null 2>/dev/null
     -mllvm -polly-detect-keep-going
     "
 else
-    echo "Polly: disabled"
+    echo "Polly: unavailable"
 fi
 
 # ── KCFLAGS ──────────────────────────────────────────────────────────────────
