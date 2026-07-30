@@ -1,0 +1,395 @@
+name: Build Android12-5.10-LTS
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU variant (ALL = KWS + KSUN + VNL)'
+        type: choice
+        options:
+          - KWS
+          - KSUN
+          - VNL
+          - ALL
+        default: KSUN      
+      clang_variant:
+        description: 'Clang toolchain Selection'
+        type: choice
+        options: 
+          - GOOGLE-CLANG
+          - LLVM-LATEST
+          - NEUTRON-LATEST
+          - GREENFORCE-LATEST
+          - ALL
+        default: GOOGLE-CLANG
+      clang_revision:
+          description: 'Google Clang revision'
+          type: string
+          default: clang-r416183b
+      clang_commit:
+          description: 'Google prebuilts commit'
+          type: string
+          default: 141af4b7b36d1bb2a70b4ef2a65faf3b46253eb9          
+      kernel_name:
+        description: 'Kernel base name'
+        type: string
+        default: AGNI      
+      ak3_url:
+        description: 'AnyKernel3 source URL'
+        type: string
+        default: https://github.com/denomsly2/AK3.git
+      ak3_ref:
+        description: 'AnyKernel3 branch'
+        type: string
+        default: master
+      kmi_symbol_check:
+        description: 'Run KMI symbol validation (KMI_function_symbols_test.py)'
+        type: boolean
+        default: false 
+jobs:  
+  # ── Resolve matrix from inputs ─────────────────────────────────────────────
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      ksu_variants: ${{ steps.resolve.outputs.ksu_variants }}
+      clang_variants: ${{ steps.resolve.outputs.clang_variants }}
+    steps:
+      - name: 🔧 Resolve variants
+        id: resolve
+        run: |
+          if [ "${{ inputs.ksu_variant }}" = "ALL" ]; then
+            echo 'ksu_variants=["KWS","KSUN","VNL"]' >> $GITHUB_OUTPUT
+          else
+            echo 'ksu_variants=["${{ inputs.ksu_variant }}"]' >> $GITHUB_OUTPUT
+          fi
+          if [ "${{ inputs.clang_variant }}" = "ALL" ]; then
+            echo 'clang_variants=["GOOGLE-CLANG","LLVM-LATEST","NEUTRON-LATEST","GREENFORCE-LATEST"]' >> $GITHUB_OUTPUT
+          else
+            echo 'clang_variants=["${{ inputs.clang_variant }}"]' >> $GITHUB_OUTPUT
+          fi
+                    
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ksu: ${{ fromJson(needs.setup.outputs.ksu_variants) }}
+        clang: ${{ fromJson(needs.setup.outputs.clang_variants) }}
+    steps:
+      - name: 📥 Checkout workflow repo (build.sh lives here)
+        uses: actions/checkout@v4
+      - name: 📦 Install build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev \
+            cpio kmod rsync zip patch curl ca-certificates \
+            python3 python3-pip python3-lxml git wget binutils jq zstd
+
+     # ── Set Timezone ──────────────────────────────────────────────────────────
+      - name: 🕒 Set Timezone 
+        run: |
+         echo "BUILD_TIME=$(TZ=Asia/Jakarta date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+         sudo rm /etc/localtime
+         sudo ln -s /usr/share/zoneinfo/Asia/Jakarta /etc/localtime
+ 
+     # ── GOOGLE CLANG ───────────────────────────────────────────
+      - name: ⬇️ Download Google Clang
+        if: matrix.clang == 'GOOGLE-CLANG'
+        run: |
+          TOOLCHAIN_DIR="$HOME/toolchain/${{ inputs.clang_revision }}"
+          mkdir -p "$TOOLCHAIN_DIR"
+          cd "$HOME/toolchain"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/${{ inputs.clang_commit }}/${{ inputs.clang_revision }}.tar.gz"
+          echo "Revision : ${{ inputs.clang_revision }}"
+          echo "Commit   : ${{ inputs.clang_commit }}"
+          echo "URL      : $URL"
+          wget -q --show-progress "$URL" \
+          -O "${{ inputs.clang_revision }}.tar.gz"
+          ls -lh "${{ inputs.clang_revision }}.tar.gz"
+          tar -xzf "${{ inputs.clang_revision }}.tar.gz" \
+          -C "$TOOLCHAIN_DIR"
+          "$TOOLCHAIN_DIR/bin/clang" --version
+          echo "CLANG_PATH=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+          echo "✅ Google Clang ready."
+    
+     # ── Official LLVM Latest ───────────────────────────────────────────
+      - name: ⬇️ Download LLVM Latest Release 
+        if: matrix.clang == 'LLVM-LATEST'
+        run: |  
+            TOOLCHAIN_DIR="$HOME/toolchain/llvm"
+            mkdir -p "$HOME/toolchain"
+            rm -rf "$TOOLCHAIN_DIR"
+            mkdir -p "$TOOLCHAIN_DIR"
+            API="https://api.github.com/repos/llvm/llvm-project/releases/latest"
+            echo "Fetching latest LLVM release..."
+            RELEASE_JSON=$(curl -fsSL "$API")
+            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+            URL=$(echo "$RELEASE_JSON" | jq -r '
+            .assets[]
+            | select(
+            (.name | test("^LLVM-.*-Linux-X64\\.tar\\.(xz|gz|zst)$"))
+              or
+            (.name | test("^clang\\+llvm-.*x86_64-linux-gnu.*\\.tar\\.(xz|gz|zst)$"))
+              or
+            (.name | test("^clang\\+llvm-.*x86_64.*linux.*\\.tar\\.(xz|gz|zst)$"))
+             )
+            | .browser_download_url
+             ' | head -n1)
+            if [ -z "$URL" ] || [ "$URL" = "null" ]; then
+            echo "::error::No official Linux x86_64 LLVM binary found for $TAG"
+            exit 1
+            fi
+            FILE=$(basename "$URL")
+            echo "Release : $TAG"
+            echo "Asset   : $FILE"
+            wget -q --show-progress "$URL" -O "$FILE"
+            case "$FILE" in
+            *.tar.xz)
+            tar -xJf "$FILE" -C "$TOOLCHAIN_DIR" --strip-components=1
+            ;;
+            *.tar.gz)
+            tar -xzf "$FILE" -C "$TOOLCHAIN_DIR" --strip-components=1
+            ;;
+            *.tar.zst)
+            tar --use-compress-program=unzstd \
+            -xf "$FILE" \
+            -C "$TOOLCHAIN_DIR" \
+            --strip-components=1
+            ;;
+            *)
+            echo "::error::Unsupported archive format: $FILE"
+            exit 1
+            ;;
+            esac
+            echo "CLANG_PATH=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+            "$TOOLCHAIN_DIR/bin/clang" --version
+            echo "✅ Latest Official LLVM Clang is ready."
+    
+    # ── Latest Neutron Clang ─────────────────────────────
+      - name: ⬇️ Download Neutron Clang latest release 
+        if: matrix.clang == 'NEUTRON-LATEST'
+        run: |
+          mkdir -p ~/toolchain/neutron-clang
+          cd ~/toolchain
+          RELEASE_URL=$(
+          curl -fsSL https://api.github.com/repos/Neutron-Toolchains/clang-build-catalogue/releases/latest |
+          jq -r '.assets[]
+          | select(.name | test("\\.(tar\\.zst|tar\\.xz|tar\\.gz)$"))
+          | .browser_download_url' \
+          | head -n1
+          )
+          echo "Download: $RELEASE_URL"
+          wget "$RELEASE_URL" -O neutron-clang.tar
+          ls -lh neutron-clang.tar
+          case "$RELEASE_URL" in
+          *.tar.zst)
+          tar --use-compress-program=unzstd -xf neutron-clang.tar -C neutron-clang
+          ;;
+          *.tar.xz)
+          tar -xf neutron-clang.tar -C neutron-clang
+          ;;
+          *.tar.gz)
+          tar -xzf neutron-clang.tar -C neutron-clang
+          ;;
+          esac
+          ~/toolchain/neutron-clang/bin/clang --version
+          echo "CLANG_PATH=$HOME/toolchain/neutron-clang" >> $GITHUB_ENV
+          echo "✅ Latest Neutron Clang ready."
+
+     # ── Latest GreenForce Clang ─────────────────────────────────
+      - name: ⬇️ Download Clang Greenforce latest release 
+        if: matrix.clang == 'GREENFORCE-LATEST'
+        run: |             
+             TOOLCHAIN_DIR="$HOME/toolchain/greenforce"
+             rm -rf "$TOOLCHAIN_DIR"
+             mkdir -p "$TOOLCHAIN_DIR"
+             API="https://api.github.com/repos/greenforce-project/greenforce_clang/releases/latest"
+             echo "Fetching latest GreenForce release..."
+             URL=$(
+             curl -fsSL "$API" | jq -r '
+             .assets[]
+             | select(.name | test("\\.(tar\\.zst|tar\\.xz|tar\\.gz)$"))
+             | .browser_download_url
+             ' | head -n1
+             )
+             TAG=$(curl -fsSL "$API" | jq -r '.tag_name')
+             if [[ -z "$URL" || "$URL" == "null" ]]; then
+             echo "::error::Unable to locate GreenForce Clang archive."
+             exit 1
+             fi
+             FILE=$(basename "$URL")
+             echo "Release : $TAG"
+             echo "Asset   : $FILE"
+             echo "URL     : $URL"
+             cd /tmp
+             wget --progress=bar:force:noscroll \
+             --tries=5 \
+             --timeout=30 \
+             "$URL" \
+             -O "$FILE"
+             case "$FILE" in
+             *.tar.zst)
+             tar --use-compress-program=unzstd \
+             -xf "$FILE" \
+             -C "$TOOLCHAIN_DIR" \
+             --strip-components=1
+             ;;
+             *.tar.xz)
+             tar -xJf "$FILE" \
+             -C "$TOOLCHAIN_DIR" \
+             --strip-components=1
+             ;;
+             *.tar.gz)
+             tar -xzf "$FILE" \
+             -C "$TOOLCHAIN_DIR" \
+             --strip-components=1
+             ;;
+             *)
+             echo "::error::Unsupported archive format."
+             exit 1
+             ;;
+             esac
+             test -x "$TOOLCHAIN_DIR/bin/clang"
+             "$TOOLCHAIN_DIR/bin/clang" --version
+             echo "CLANG_PATH=$TOOLCHAIN_DIR" >> "$GITHUB_ENV"
+             echo "✅ GreenForce Clang is ready."
+        
+      # ── Verify Selected Clang ────────────────────────────────────────────
+      - name: 🔍 Run Clang Audit Verification
+        run: |
+          case "${{ matrix.clang }}" in
+            GOOGLE-CLANG) TC_PATH="$HOME/toolchain/${{ inputs.clang_revision }}/bin/clang";;
+            LLVM-LATEST) TC_PATH="$HOME/toolchain/llvm/bin/clang";;
+            NEUTRON-LATEST) TC_PATH="$HOME/toolchain/neutron-clang/bin/clang";;    
+            GREENFORCE-LATEST) TC_PATH="$HOME/toolchain/greenforce/bin/clang";;
+          esac
+          echo "=== Auditing: ${{ matrix.clang }} ==="
+          $TC_PATH --version | head -n 2 || true
+          readelf -S $TC_PATH | grep -iE "bolt|llvm_bb" || echo "No BOLT layout found"
+          strings $TC_PATH | grep -iE "regalloc-model|inline-model|mlgo" | head -n 2 || echo "No MLGO models embedded"
+      
+      # ── Export CLANG_PATH ────────────────────────────────────────────────
+      - name: 🌱 Export CLANG_PATH
+        run: |
+          case "${{ matrix.clang }}" in
+            GOOGLE-CLANG) echo "CLANG_PATH=$HOME/toolchain/${{ inputs.clang_revision }}" >> $GITHUB_ENV;;
+            LLVM-LATEST) echo "CLANG_PATH=$HOME/toolchain/llvm" >> $GITHUB_ENV;;
+            NEUTRON-LATEST) echo "CLANG_PATH=$HOME/toolchain/neutron-clang" >> $GITHUB_ENV;;  
+            GREENFORCE-LATEST) echo "CLANG_PATH=$HOME/toolchain/greenforce" >> $GITHUB_ENV;;
+          esac
+                      
+      # ── KSU setup ────────────────────────────────────────────────────────
+      - name: 🧩 Apply KernelSU (${{ matrix.ksu }})
+        if: matrix.ksu != 'VNL'
+        run: |
+          if [ "${{ matrix.ksu }}" = "KWS" ]; then
+            curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s master
+            printf '\nCONFIG_KSU=y\nCONFIG_KSU_MANUAL_SU=n\nCONFIG_KSU_SUSFS=n\n' \
+              >> arch/arm64/configs/gki_defconfig
+          else
+            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/dev-susfs/kernel/setup.sh" | bash -s dev-susfs
+            printf '\nCONFIG_KSU=y\nCONFIG_KSU_MANUAL_SU=n\nCONFIG_KSU_SUSFS=y\n' \
+              >> arch/arm64/configs/gki_defconfig
+          fi
+          
+      # ── Verify KSU integration ──────────────────────────────────────────────
+      - name: ✅ Verify KSU integration (${{ matrix.ksu }})
+        if: matrix.ksu != 'VNL'
+        run: |
+          echo "=== KSU directory check ==="
+          ls -la KernelSU* 2>/dev/null || echo "WARNING: No KernelSU dir found!"
+          echo "=== drivers/kernelsu check ==="
+          ls drivers/kernelsu/ 2>/dev/null || echo "WARNING: drivers/kernelsu missing!"
+          echo "=== Kconfig/Makefile hooks ==="
+          grep -r "kernelsu\|KSU" drivers/Makefile drivers/Kconfig 2>/dev/null || echo "WARNING: No KSU hooks in drivers!"
+          echo "=== gki_defconfig KSU entries ==="
+          grep "CONFIG_KSU" arch/arm64/configs/gki_defconfig || echo "WARNING: No KSU configs in gki_defconfig!"
+
+      # ── Apply SUSFS patches ──────────────────────────────────────────────
+      - name: 🩹 Apply SUSFS patches (KSUN only)
+        if: matrix.ksu == 'KSUN'
+        run: |
+          git clone https://gitlab.com/simonpunk/susfs4ksu/ -b gki-android12-5.10 sus
+          rm -rf sus/.git
+          susfs=sus/kernel_patches
+          cp -r "$susfs/fs" .
+          cp -r "$susfs/include" .
+          cp -r "$susfs/50_add_susfs_in_gki-android12-5.10.patch" .
+          patch -p1 < 50_add_susfs_in_gki-android12-5.10.patch
+            
+      # ── Apply NoMount ──────────────────────────────────────────────
+      - name: 🚫 Apply NoMount patch
+        if: matrix.ksu == 'KWS' || matrix.ksu == 'KSUN'
+        run: |
+          git clone --depth=1 https://github.com/maxsteeel/nomount nomount          
+          echo "=== Import NoMount sources ==="
+          mkdir -p fs
+          cp nomount/kernel/src/nomount.c fs/
+          cp nomount/kernel/src/nomount.h fs/
+          wget -q \
+          https://raw.githubusercontent.com/maxsteeel/nomount/master/kernel/patches/nomount_5.10_kernel_integration.patch \
+          -O nomount.patch  
+          patch -p1 --forward < nomount.patch || true
+          echo "=== Enable NoMount ==="
+          grep -q '^CONFIG_NOMOUNT=' arch/arm64/configs/gki_defconfig \
+          && sed -i \
+          's/^CONFIG_NOMOUNT=.*/CONFIG_NOMOUNT=y/' \
+          arch/arm64/configs/gki_defconfig \
+          || echo 'CONFIG_NOMOUNT=y' \
+          >> arch/arm64/configs/gki_defconfig          
+          echo "=== Verify ==="
+          test -f fs/nomount.c && echo "nomount.c OK"
+          test -f fs/nomount.h && echo "nomount.h OK"
+          grep CONFIG_NOMOUNT arch/arm64/configs/gki_defconfig
+          
+      # ── Inject LOCALVERSION ──────────────────────────────────────────────
+      - name: 🏷️ Set LOCALVERSION in gki_defconfig
+        run: |
+          LOCALVER="-${{ inputs.kernel_name }}"
+          printf '\nCONFIG_LOCALVERSION="%s"\n' "$LOCALVER" \
+            >> arch/arm64/configs/gki_defconfig
+          echo "LOCALVERSION set to: $LOCALVER"      
+    
+      # ── Build ────────────────────────────────────────────────────────────
+      - name: 🏗️ Run build.sh
+        env:
+          CLANG_PATH: ${{ env.CLANG_PATH }}
+          CLANG_VARIANT: ${{ matrix.clang }}
+          KMI_SYMBOL_CHECK: ${{ inputs.kmi_symbol_check }}
+        run: |
+          chmod +x build.sh
+          ./build.sh
+    
+      # ── Package ──────────────────────────────────────────────────────────
+      - name: 📦 Package with AnyKernel3
+        run: |
+          BUILD_TIME=$(date +"%Y%m%d-%H%M")
+          ZIP_NAME="${{ inputs.kernel_name }}-${{ matrix.ksu }}-${{ matrix.clang }}-${BUILD_TIME}"
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          git clone \
+          --depth=1 \
+          --branch "${{ inputs.ak3_ref }}" \
+          "${{ inputs.ak3_url }}" \
+            anykernel
+          cp out/arch/arm64/boot/Image anykernel/Image
+          cd anykernel
+          zip -r9 "../${ZIP_NAME}.zip" . \
+            --exclude="*.git*" --exclude="README.md" --exclude="*.placeholder"
+      - name: 📤 Upload kernel image-config
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ matrix.ksu }}-${{ matrix.clang }}-${{ matrix.config }}-${{ inputs.kernel_ref }}
+          path: out/arch/arm64/boot/Image
+          if-no-files-found: error
+      - name: 📤 Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: anykernel/*
+          if-no-files-found: error
+
+      
+
+
+
